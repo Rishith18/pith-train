@@ -9,7 +9,7 @@ Run (needs >=2 GPUs; ep-size must divide the world)::
 Builds a real model (``--model``: deepseek-v2-lite, qwen3-30b-a3b, gpt-oss-20b;
 reduced to a few layers) with FSDP2 + DualPipeV, steps the composed
 ``[Muon, AdamW]`` on synthetic grads to populate state, then
-save_checkpoint -> fresh optimizers -> load_checkpoint and asserts the optimizer
+save_checkpoint -> fresh optimizers -> find_checkpoint + load_checkpoint and asserts the optimizer
 state round-trips exactly. Exercises the resharding (``to_canonical_optim`` /
 ``to_localized_optim``) for a combined multi-optimizer state dict over stacked
 experts (expanded to per-expert FQNs on disk) and DualPipeV ``module.N.``
@@ -27,14 +27,15 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from pithtrain.contexts import training
-from pithtrain.modules.distributed import setup_distributed
-from pithtrain.modules.logging import setup_logging
-from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler, setup_model
-from pithtrain.tasks.pretrain_lm import (
-    PretrainLMCfg,
+from pithtrain.modules.checkpoint import (
+    find_checkpoint,
     load_checkpoint,
     save_checkpoint,
 )
+from pithtrain.modules.distributed import setup_distributed
+from pithtrain.modules.logging import setup_logging
+from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler, setup_model
+from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 NUM_LAYERS = 4  # a few MoE layers; small enough to build quickly
 
@@ -96,14 +97,15 @@ def main(cfg: PretrainLMCfg):
     assert not bad, ("non-finite params after step", bad[:3])
 
     # Snapshot, save, rebuild fresh optimizers, load, compare.
-    training.step = 1
     before = opt_state_snapshot(optimizers, model)
-    save_checkpoint(cfg)
+    save_checkpoint(cfg.training.save_location, 1)
 
     # fresh, empty-state optimizers + schedulers
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
-    load_checkpoint(cfg)
+    step = find_checkpoint(cfg.training.save_location)
+    assert step == 1, f"find_checkpoint returned {step}, expected 1"
+    load_checkpoint(cfg.training.save_location, step)
     after = opt_state_snapshot(training.optimizers, model)
 
     assert set(before) == set(after), "param FQN set changed across the round-trip"
@@ -172,11 +174,9 @@ def _entry():
         (scratch / "config.json").write_text(json.dumps(config))
     torch.distributed.barrier()
     t.model = scratch / "config.json"
-    t.dataset = scratch  # unused; set to satisfy the config
     t.save_location = scratch / "checkpoint"
 
     # Build model + optimizers + schedulers directly (no dataset needed).
-    training.step = 0
     torch.manual_seed(0)
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)

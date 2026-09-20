@@ -9,14 +9,14 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 MODELS = {
     "deepseek-v2-lite": {
-        "config": "examples/pretrain_lm/deepseek-v2-lite/config.json",
+        "model": "examples/pretrain_lm/deepseek-v2-lite",
         "dataset": "workspace/datasets/dclm-baseline/toktxt/deepseek-v2",
         "save_location": "workspace/checkpoints/deepseek-v2-lite",
         "moe_load_balance_type": "sequence",
         "moe_load_balance_coef": 1e-3,
     },
     "qwen3-30b-a3b": {
-        "config": "examples/pretrain_lm/qwen3-30b-a3b/config.json",
+        "model": "examples/pretrain_lm/qwen3-30b-a3b",
         "dataset": "workspace/datasets/dclm-baseline/toktxt/qwen3",
         "save_location": "workspace/checkpoints/qwen3-30b-a3b",
         "moe_load_balance_type": "global-batch",
@@ -45,13 +45,15 @@ global_batch_size = 32 * dp_size
 
 cfg = PretrainLMCfg()
 
+cfg.dataset = Path(specs["dataset"])
+
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = pp_size
 distributed.expert_parallel_size = ep_size
 distributed.context_parallel_size = cp_size
 
 training = cfg.training
-training.model = Path(specs["config"])
+training.model = Path(specs["model"])
 training.optimizer = make_adamw_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1e-6
@@ -59,7 +61,6 @@ training.max_steps = 6
 training.micro_batch_size = 1
 training.global_batch_size = global_batch_size
 training.sequence_length = parsed.sequence_length
-training.dataset = Path(specs["dataset"])
 training.moe_load_balance_type = specs["moe_load_balance_type"]
 training.moe_load_balance_coef = specs["moe_load_balance_coef"]
 training.fp8 = False

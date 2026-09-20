@@ -9,13 +9,15 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
+cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
+
 distributed = cfg.distributed
 distributed.context_parallel_size = 1
 distributed.pipeline_parallel_size = 2
 distributed.expert_parallel_size = 2
 
 training = cfg.training
-training.model = Path("examples/pretrain_lm/deepseek-v2-lite/config.json")
+training.model = Path("examples/pretrain_lm/deepseek-v2-lite")
 training.optimizer = make_muon_optimizer
 kwargs = dict(start_lr=1.0e-4, warmup_ratio=0.00, final_lr=1.0e-4)
 training.scheduler = partial(make_wsd_scheduler, **kwargs)
@@ -25,7 +27,6 @@ training.max_steps = 64
 training.micro_batch_size = 1
 training.global_batch_size = 1024
 training.sequence_length = 2048
-training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
 training.moe_load_balance_type = "sequence"
 training.moe_load_balance_coef = 3e-3
 training.fp8 = True

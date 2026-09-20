@@ -8,13 +8,15 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
+cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3")
+
 distributed = cfg.distributed
 distributed.context_parallel_size = 1
 distributed.pipeline_parallel_size = 1
 distributed.expert_parallel_size = 8
 
 training = cfg.training
-training.model = Path("examples/pretrain_lm/qwen3-30b-a3b/config.json")
+training.model = Path("examples/pretrain_lm/qwen3-30b-a3b")
 training.optimizer = make_muon_optimizer
 kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.03, final_lr=1.0e-5)
 training.scheduler = partial(make_wsd_scheduler, **kwargs)
@@ -23,7 +25,6 @@ training.max_steps = 4096
 training.micro_batch_size = 1
 training.global_batch_size = 1024
 training.sequence_length = 2048
-training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3")
 training.moe_load_balance_type = "global-batch"
 training.moe_load_balance_coef = 1e-3
 training.fp8 = False
