@@ -193,6 +193,14 @@ class TrainingCfg(SlottedDefault):
     enough to pretrain from scratch.
     """
 
+    hf_import_path: Optional[Path] = None
+    """
+    HuggingFace safetensors directory. Consulted at startup only when no DCP checkpoint exists
+    under save_location: weights stream directly into the FSDP-sharded parameters, bypassing
+    hf2dcp. DCP resume wins when both are set. Generic mapping only (Qwen3, DeepSeek-V2); MXFP4 or
+    fused-expert checkpoints must still go through hf2dcp.
+    """
+
     save_interval: Optional[int] = None
     """
     The interval (in steps) at which to save checkpoints. When None, checkpoint saving is disabled
