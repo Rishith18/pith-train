@@ -1,8 +1,13 @@
 """Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-122B-A10B, and Qwen/Qwen3.5-397B-A17B (text tower)."""
 
+import json
+from pathlib import Path
+from typing import Dict
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from pithtrain.contexts import distributed, training
@@ -459,3 +464,58 @@ class Qwen35MoeModel(nn.Module):
         if self.stage_index == self.stage_count - 1:
             hidden_states = self.forward_epilog(hidden_states)
         return hidden_states
+
+
+# ─── HF streaming loader ──────────────────────────────────────────────────────
+
+_QWEN35_DROP_PREFIXES = ("visual.", "mtp.")
+_QWEN35_INIT_ONLY_SUFFIXES = (".linear_attn.A_log", ".linear_attn.dt_bias")
+
+
+def _qwen35_remap(canon: str) -> str:
+    """
+    Canonical -> HF key for Qwen3.5-MoE. Runtime FQNs live under the text tower and translate to
+    ``language_model.<canon>``; ``lm_head.weight`` is the sole top-level exception. Runtime
+    experts use GroupedLinear (canonical carries ``.weight``); HF ships them fused without the
+    suffix, so we strip it on expert keys.
+    """
+    if canon == "lm_head.weight":
+        return canon
+    if ".mlp.experts." in canon and canon.endswith((".gate_up_proj.weight", ".down_proj.weight")):
+        canon = canon.removesuffix(".weight")
+    return "language_model." + canon
+
+
+class Qwen35MoeHfLoader:
+    """Qwen3.5-MoE: language_model.-nested text tower, drop vision/mtp, GDN init-only params."""
+
+    name = "qwen35_moe"
+
+    def detect_hf(self, hf_root: Path) -> bool:
+        config_path = Path(hf_root, "config.json")
+        if not config_path.is_file():
+            return False
+        with open(config_path) as f:
+            config = json.load(f)
+        if config.get("model_type") == "qwen3_5_moe_text":
+            return True
+        text = config.get("text_config", {})
+        return isinstance(text, dict) and text.get("model_type") == "qwen3_5_moe_text"
+
+    def owns_local(self, local_fqn: str) -> bool:
+        return not local_fqn.endswith(_QWEN35_INIT_ONLY_SUFFIXES)
+
+    def plan_param(
+        self,
+        local_fqn: str,
+        param: DTensor,
+        weight_map: Dict[str, str],
+        named_modules: Dict[str, nn.Module],
+    ) -> list:
+        from pithtrain.modules.hf_loader import _generic_plan_param  # lazy: avoids circular
+        return _generic_plan_param(local_fqn, param, weight_map, named_modules, remap=_qwen35_remap)
+
+    def expected_unmapped(self, hf_keys: set) -> set:
+        return {"lm_head.weight"} & hf_keys | {
+            k for k in hf_keys if k.startswith(_QWEN35_DROP_PREFIXES)
+        }

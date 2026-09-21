@@ -26,7 +26,6 @@ from torch.distributed.tensor.placement_types import Shard
 
 from pithtrain.contexts import logging
 from pithtrain.modules.checkpoint import expand_localized_fqn, find_moe, local_shard_range
-from pithtrain.operators.mxfp4 import dequantize_mxfp4
 
 __all__ = ["load_hf_into_model"]
 
@@ -193,213 +192,6 @@ class GenericHfLoader:
         return {"lm_head.weight"} & hf_keys
 
 
-_GPT_OSS_EXPERT_BIAS_LEAVES = {"gate_up_proj_bias", "down_proj_bias"}
-_GPT_OSS_EXPERT_MXFP4_LEAVES = {"gate_up_proj", "down_proj"}
-
-
-class GptOssHfLoader:
-    """GPT-OSS: unquantized fused biases + MXFP4-quantized expert weights."""
-
-    name = "gpt_oss"
-
-    def detect_hf(self, hf_root: Path) -> bool:
-        config_path = Path(hf_root, "config.json")
-        if not config_path.is_file():
-            return False
-        with open(config_path) as f:
-            return json.load(f).get("model_type") == "gpt_oss"
-
-    def owns_local(self, local_fqn: str) -> bool:
-        return True
-
-    def plan_param(
-        self,
-        local_fqn: str,
-        param: DTensor,
-        weight_map: Dict[str, str],
-        named_modules: Dict[str, nn.Module],
-    ) -> List[CopyOp]:
-        moe = find_moe(local_fqn, named_modules)
-        canon_keys = expand_localized_fqn(local_fqn, named_modules)
-        if moe is None:
-            return _generic_plan_param(local_fqn, param, weight_map, named_modules)
-
-        # canon_keys is length experts_per_rank; the leaf names the projection.
-        leaf = canon_keys[0].rsplit(".", 1)[-1]
-        if leaf in _GPT_OSS_EXPERT_BIAS_LEAVES:
-            return _gpt_oss_plan_bias(local_fqn, param, weight_map, moe, canon_keys)
-        if leaf in _GPT_OSS_EXPERT_MXFP4_LEAVES:
-            return _gpt_oss_plan_mxfp4(local_fqn, param, weight_map, moe, canon_keys)
-        return _generic_plan_param(local_fqn, param, weight_map, named_modules)
-
-    def expected_unmapped(self, hf_keys: set) -> set:
-        return {"lm_head.weight"} & hf_keys
-
-
-def _gpt_oss_expert_base(canon_key: str) -> Tuple[str, str]:
-    """
-    Split ``layers.L.mlp.experts.42.gate_up_proj`` (or _bias) into the layer-prefixed fused HF key
-    (``layers.L.mlp.experts.gate_up_proj``) plus the leaf suffix (``gate_up_proj``). HF stores
-    every expert projection as a single fused ``[E, ...]`` key with no numeric index.
-    """
-    # canon_key ends with ".experts.<idx>.<suffix>"; drop the "<idx>." segment.
-    prefix, _, tail = canon_key.rpartition(".experts.")
-    idx_str, _, suffix = tail.partition(".")
-    assert idx_str.isdigit(), "expected indexed expert key, got %s" % canon_key
-    return "%s.experts.%s" % (prefix, suffix), suffix
-
-
-def _gpt_oss_plan_bias(
-    local_fqn: str,
-    param: DTensor,
-    weight_map: Dict[str, str],
-    moe: nn.Module,
-    canon_keys: List[str],
-) -> List[CopyOp]:
-    local = param._local_tensor
-    dp_rank = param.device_mesh.get_local_rank()
-    dp_size = param.device_mesh.size()
-    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    assert dp_len == local.shape[0], "%s: expert dp_len %d != local shape %d" % (
-        local_fqn,
-        dp_len,
-        local.shape[0],
-    )
-    hf_key, _ = _gpt_oss_expert_base(canon_keys[0])
-    if hf_key not in weight_map:
-        raise KeyError("HF checkpoint missing %s for local param %s" % (hf_key, local_fqn))
-    shard = weight_map[hf_key]
-    ep_start = _ep_start_from_canon(canon_keys[0])
-    ops: List[CopyOp] = []
-    for i in range(dp_len):
-        global_idx = ep_start + dp_offset + i
-        ops.append(
-            CopyOp(
-                local_fqn=local_fqn,
-                dst=local[i : i + 1],
-                hf_keys=(hf_key,),
-                shard_files=(shard,),
-                row_slice=slice(global_idx, global_idx + 1),
-                transform=None,
-            )
-        )
-    return ops
-
-
-def _gpt_oss_plan_mxfp4(
-    local_fqn: str,
-    param: DTensor,
-    weight_map: Dict[str, str],
-    moe: nn.Module,
-    canon_keys: List[str],
-) -> List[CopyOp]:
-    local = param._local_tensor
-    dp_rank = param.device_mesh.get_local_rank()
-    dp_size = param.device_mesh.size()
-    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    assert dp_len == local.shape[0], "%s: expert dp_len %d != local shape %d" % (
-        local_fqn,
-        dp_len,
-        local.shape[0],
-    )
-    base_key, _ = _gpt_oss_expert_base(canon_keys[0])
-    blocks_key = base_key + "_blocks"
-    scales_key = base_key + "_scales"
-    for k in (blocks_key, scales_key):
-        if k not in weight_map:
-            raise KeyError("HF checkpoint missing %s for local param %s" % (k, local_fqn))
-    shards = (weight_map[blocks_key], weight_map[scales_key])
-    ep_start = _ep_start_from_canon(canon_keys[0])
-    ops: List[CopyOp] = []
-    for i in range(dp_len):
-        global_idx = ep_start + dp_offset + i
-        ops.append(
-            CopyOp(
-                local_fqn=local_fqn,
-                dst=local[i : i + 1],
-                hf_keys=(blocks_key, scales_key),
-                shard_files=shards,
-                row_slice=slice(global_idx, global_idx + 1),
-                transform=_mxfp4_transform,
-            )
-        )
-    return ops
-
-
-def _mxfp4_transform(srcs: List[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
-    # srcs are [1, out, G, 16] blocks + [1, out, G] scales; dequant yields [1, out, G*B*2].
-    return dequantize_mxfp4(srcs[0], srcs[1], dtype=dtype)
-
-
-def _ep_start_from_canon(canon_key: str) -> int:
-    """Recover this EP-rank's starting global expert index from an indexed canonical key."""
-    _, _, tail = canon_key.rpartition(".experts.")
-    idx_str, _, _ = tail.partition(".")
-    return int(idx_str)
-
-
-_QWEN35_DROP_PREFIXES = ("visual.", "mtp.")
-_QWEN35_INIT_ONLY_SUFFIXES = (".linear_attn.A_log", ".linear_attn.dt_bias")
-
-
-class Qwen35MoeHfLoader:
-    """Qwen3.5-MoE: language_model.-nested text tower, drop vision/mtp, GDN init-only params."""
-
-    name = "qwen35_moe"
-
-    def detect_hf(self, hf_root: Path) -> bool:
-        config_path = Path(hf_root, "config.json")
-        if not config_path.is_file():
-            return False
-        with open(config_path) as f:
-            config = json.load(f)
-        if config.get("model_type") == "qwen3_5_moe_text":
-            return True
-        text = config.get("text_config", {})
-        return isinstance(text, dict) and text.get("model_type") == "qwen3_5_moe_text"
-
-    def owns_local(self, local_fqn: str) -> bool:
-        return not local_fqn.endswith(_QWEN35_INIT_ONLY_SUFFIXES)
-
-    def plan_param(
-        self,
-        local_fqn: str,
-        param: DTensor,
-        weight_map: Dict[str, str],
-        named_modules: Dict[str, nn.Module],
-    ) -> List[CopyOp]:
-        return _generic_plan_param(local_fqn, param, weight_map, named_modules, remap=_qwen35_remap)
-
-    def expected_unmapped(self, hf_keys: set) -> set:
-        return {"lm_head.weight"} & hf_keys | {
-            k for k in hf_keys if k.startswith(_QWEN35_DROP_PREFIXES)
-        }
-
-
-def _qwen35_remap(canon: str) -> str:
-    """
-    Canonical -> HF key for Qwen3.5-MoE. Runtime FQNs live under the text tower and translate to
-    ``language_model.<canon>``; ``lm_head.weight`` is the sole top-level exception. Runtime
-    experts use GroupedLinear (canonical carries ``.weight``); HF ships them fused without the
-    suffix, so we strip it on expert keys.
-    """
-    if canon == "lm_head.weight":
-        return canon
-    if ".mlp.experts." in canon and canon.endswith((".gate_up_proj.weight", ".down_proj.weight")):
-        canon = canon.removesuffix(".weight")
-    return "language_model." + canon
-
-
-_LOADERS: List[ModelHfLoader] = [GptOssHfLoader(), Qwen35MoeHfLoader(), GenericHfLoader()]
-
-
-def _select(hf_root: Path) -> ModelHfLoader:
-    for loader in _LOADERS:
-        if loader.detect_hf(hf_root):
-            return loader
-    raise RuntimeError("No HF loader claimed %s" % hf_root)
-
-
 def _plan_copies(
     model: nn.Module, weight_map: Dict[str, str], loader: ModelHfLoader
 ) -> Tuple[List[CopyOp], set, List[str]]:
@@ -499,3 +291,20 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
         "Load HF checkpoint: %d ops, %d skipped, elapsed min=%.1fs, max=%.1fs"
         % (filled, len(skipped), dt_min.item(), dt_max.item())
     )
+
+
+# ─── Per-model loaders ────────────────────────────────────────────────────────
+# Imported after all core definitions to allow model files to import CopyOp /
+# _generic_plan_param from this module without hitting a circular import.
+
+from pithtrain.models.gpt_oss import GptOssHfLoader  # noqa: E402
+from pithtrain.models.qwen35_moe import Qwen35MoeHfLoader  # noqa: E402
+
+_LOADERS: List[ModelHfLoader] = [GptOssHfLoader(), Qwen35MoeHfLoader(), GenericHfLoader()]
+
+
+def _select(hf_root: Path) -> ModelHfLoader:
+    for loader in _LOADERS:
+        if loader.detect_hf(hf_root):
+            return loader
+    raise RuntimeError("No HF loader claimed %s" % hf_root)
