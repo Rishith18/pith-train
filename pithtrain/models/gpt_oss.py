@@ -3,7 +3,7 @@
 import json
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -441,23 +441,16 @@ _GPT_OSS_EXPERT_BIAS_LEAVES = {"gate_up_proj_bias", "down_proj_bias"}
 _GPT_OSS_EXPERT_MXFP4_LEAVES = {"gate_up_proj", "down_proj"}
 
 
-def _gpt_oss_expert_base(canon_key: str) -> Tuple[str, str]:
+def _parse_expert_key(canon_key: str) -> Tuple[str, int]:
     """
-    Split ``layers.L.mlp.experts.42.gate_up_proj`` (or _bias) into the layer-prefixed fused HF key
-    (``layers.L.mlp.experts.gate_up_proj``) plus the leaf suffix (``gate_up_proj``). HF stores
+    Split ``layers.L.mlp.experts.42.gate_up_proj`` into the fused HF base key
+    (``layers.L.mlp.experts.gate_up_proj``) and the global expert index (42). HF stores
     every expert projection as a single fused ``[E, ...]`` key with no numeric index.
     """
     prefix, _, tail = canon_key.rpartition(".experts.")
     idx_str, _, suffix = tail.partition(".")
     assert idx_str.isdigit(), "expected indexed expert key, got %s" % canon_key
-    return "%s.experts.%s" % (prefix, suffix), suffix
-
-
-def _ep_start_from_canon(canon_key: str) -> int:
-    """Recover this EP-rank's starting global expert index from an indexed canonical key."""
-    _, _, tail = canon_key.rpartition(".experts.")
-    idx_str, _, _ = tail.partition(".")
-    return int(idx_str)
+    return "%s.experts.%s" % (prefix, suffix), int(idx_str)
 
 
 def _mxfp4_transform(srcs: List[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
@@ -484,8 +477,7 @@ def _gpt_oss_plan_expert(
         dp_len,
         local.shape[0],
     )
-    base_key, _ = _gpt_oss_expert_base(canon_keys[0])
-    ep_start = _ep_start_from_canon(canon_keys[0])
+    base_key, ep_start = _parse_expert_key(canon_keys[0])
     if mxfp4:
         blocks_key = base_key + "_blocks"
         scales_key = base_key + "_scales"
@@ -494,7 +486,7 @@ def _gpt_oss_plan_expert(
                 raise KeyError("HF checkpoint missing %s for local param %s" % (k, local_fqn))
         hf_keys: Tuple[str, ...] = (blocks_key, scales_key)
         shard_files: Tuple[str, ...] = (weight_map[blocks_key], weight_map[scales_key])
-        transform: Optional[object] = _mxfp4_transform
+        transform = _mxfp4_transform
     else:
         if base_key not in weight_map:
             raise KeyError("HF checkpoint missing %s for local param %s" % (base_key, local_fqn))
