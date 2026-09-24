@@ -449,7 +449,8 @@ def _parse_expert_key(canon_key: str) -> Tuple[str, int]:
     """
     prefix, _, tail = canon_key.rpartition(".experts.")
     idx_str, _, suffix = tail.partition(".")
-    assert idx_str.isdigit(), "expected indexed expert key, got %s" % canon_key
+    if not idx_str.isdigit():
+        raise RuntimeError("expected indexed expert key, got %s" % canon_key)
     return "%s.experts.%s" % (prefix, suffix), int(idx_str)
 
 
@@ -472,11 +473,10 @@ def _gpt_oss_plan_expert(
     dp_rank = param.device_mesh.get_local_rank()
     dp_size = param.device_mesh.size()
     dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    assert dp_len == local.shape[0], "%s: expert dp_len %d != local shape %d" % (
-        local_fqn,
-        dp_len,
-        local.shape[0],
-    )
+    if dp_len != local.shape[0]:
+        raise RuntimeError(
+            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
+        )
     base_key, ep_start = _parse_expert_key(canon_keys[0])
     if mxfp4:
         blocks_key = base_key + "_blocks"

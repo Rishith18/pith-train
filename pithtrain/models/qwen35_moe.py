@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +12,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
+from pithtrain.modules.checkpoint import expand_localized_fqn, find_moe, local_shard_range
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.cp_sequence import (
     contiguous_to_zigzag,
@@ -473,17 +474,61 @@ _QWEN35_INIT_ONLY_SUFFIXES = (".linear_attn.A_log", ".linear_attn.dt_bias")
 
 
 def _qwen35_remap(canon: str) -> str:
-    """
-    Canonical -> HF key for Qwen3.5-MoE. Runtime FQNs live under the text tower and translate to
-    ``language_model.<canon>``; ``lm_head.weight`` is the sole top-level exception. Runtime
-    experts use GroupedLinear (canonical carries ``.weight``); HF ships them fused without the
-    suffix, so we strip it on expert keys.
-    """
+    """Canonical -> HF key for non-expert params: prepend ``language_model.``."""
     if canon == "lm_head.weight":
         return canon
-    if ".mlp.experts." in canon and canon.endswith((".gate_up_proj.weight", ".down_proj.weight")):
-        canon = canon.removesuffix(".weight")
     return "language_model." + canon
+
+
+def _qwen35_expert_base(canon_key: str) -> Tuple[str, int]:
+    """
+    Split ``layers.L.mlp.experts.42.gate_up_proj.weight`` into the fused HF key
+    (``language_model.layers.L.mlp.experts.gate_up_proj``) and the global expert start index (42).
+    HF stores all experts fused as ``[E, out, in]`` with no per-expert index; the canonical key
+    carries a per-expert index AND a ``.weight`` GroupedLinear suffix that both must be stripped.
+    """
+    prefix, _, tail = canon_key.rpartition(".experts.")
+    idx_str, _, suffix = tail.partition(".")
+    if not idx_str.isdigit():
+        raise RuntimeError("expected indexed expert key, got %s" % canon_key)
+    hf_suffix = suffix.removesuffix(".weight")
+    return "language_model.%s.experts.%s" % (prefix, hf_suffix), int(idx_str)
+
+
+def _qwen35_plan_expert(
+    local_fqn: str,
+    param: DTensor,
+    weight_map: Dict[str, str],
+    moe: nn.Module,
+    canon_keys: List[str],
+) -> list:
+    from pithtrain.modules.hf_loader import CopyOp  # lazy: avoids hf_loader <-> qwen35_moe circular
+    local = param._local_tensor
+    dp_rank = param.device_mesh.get_local_rank()
+    dp_size = param.device_mesh.size()
+    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
+    if dp_len != local.shape[0]:
+        raise RuntimeError(
+            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
+        )
+    hf_key, ep_start = _qwen35_expert_base(canon_keys[0])
+    if hf_key not in weight_map:
+        raise KeyError("HF checkpoint missing %s for local param %s" % (hf_key, local_fqn))
+    shard = weight_map[hf_key]
+    ops = []
+    for i in range(dp_len):
+        global_idx = ep_start + dp_offset + i
+        ops.append(
+            CopyOp(
+                local_fqn=local_fqn,
+                dst=local[i : i + 1],
+                hf_keys=(hf_key,),
+                shard_files=(shard,),
+                row_slice=slice(global_idx, global_idx + 1),
+                transform=None,
+            )
+        )
+    return ops
 
 
 class Qwen35MoeHfLoader:
@@ -513,6 +558,10 @@ class Qwen35MoeHfLoader:
         named_modules: Dict[str, nn.Module],
     ) -> list:
         from pithtrain.modules.hf_loader import _generic_plan_param  # lazy: avoids circular
+        moe = find_moe(local_fqn, named_modules)
+        if moe is not None:
+            canon_keys = expand_localized_fqn(local_fqn, named_modules)
+            return _qwen35_plan_expert(local_fqn, param, weight_map, moe, canon_keys)
         return _generic_plan_param(local_fqn, param, weight_map, named_modules, remap=_qwen35_remap)
 
     def expected_unmapped(self, hf_keys: set) -> set:

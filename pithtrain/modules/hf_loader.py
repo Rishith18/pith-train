@@ -93,6 +93,11 @@ def _assert_shardable(local_fqn: str, param: DTensor) -> None:
         raise RuntimeError(
             "%s is not a DTensor; call load_hf_into_model after apply_fsdp" % local_fqn
         )
+    if len(param.placements) > 1:
+        raise RuntimeError(
+            "%s: HSDP (hsdp_replica > 1) is not supported by load_hf_into_model; "
+            "use hf2dcp offline conversion instead" % local_fqn
+        )
     if (
         not param.placements
         or not isinstance(param.placements[0], Shard)
@@ -124,11 +129,10 @@ def _generic_plan_param(
         if hf_key not in weight_map:
             raise KeyError("HF checkpoint missing %s for local param %s" % (hf_key, local_fqn))
         start, length = local_shard_range(param.shape[0], dp_rank, dp_size)
-        assert length == local.shape[0], "%s: computed length %d != local shape %d" % (
-            local_fqn,
-            length,
-            local.shape[0],
-        )
+        if length != local.shape[0]:
+            raise RuntimeError(
+                "%s: computed length %d != local shape %d" % (local_fqn, length, local.shape[0])
+            )
         return [
             CopyOp(
                 local_fqn=local_fqn,
@@ -141,11 +145,10 @@ def _generic_plan_param(
         ]
 
     dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    assert dp_len == local.shape[0], "%s: expert dp_len %d != local shape %d" % (
-        local_fqn,
-        dp_len,
-        local.shape[0],
-    )
+    if dp_len != local.shape[0]:
+        raise RuntimeError(
+            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
+        )
     ops: List[CopyOp] = []
     for i, canon in enumerate(canon_keys[dp_offset : dp_offset + dp_len]):
         hf_key = remap(canon)
