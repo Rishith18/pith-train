@@ -12,6 +12,7 @@ Then asserts every local DTensor shard matches per parameter.
 import argparse
 import shutil
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.modules.checkpoint import load_checkpoint
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.hf_loader import load_hf_into_model
+from pithtrain.modules.logging import setup_stdout
 from pithtrain.modules.training import TrainingCfg, setup_model
 from pithtrain.tasks.convert_checkpoint._core import ConvertCheckpointCfg, hf2dcp
 
@@ -156,7 +158,9 @@ def _entry() -> None:
     cfg.distributed.pipeline_parallel_size = parsed.pp_size
     cfg.distributed.expert_parallel_size = parsed.ep_size
     cfg.distributed.context_parallel_size = parsed.cp_size
+    cfg.distributed.timeout = timedelta(hours=2)
 
+    setup_stdout()
     setup_distributed(cfg)
     main(parsed.model, Path(parsed.hf_ckpt))
 
